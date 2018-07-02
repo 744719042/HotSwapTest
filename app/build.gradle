@@ -1,0 +1,147 @@
+import com.android.build.api.transform.QualifiedContent
+import com.android.build.api.transform.Transform
+import com.android.build.api.transform.Format
+import com.android.build.api.transform.TransformException
+import com.android.build.api.transform.TransformInput
+import com.android.build.api.transform.TransformInvocation
+import com.android.build.api.transform.TransformOutputProvider
+import com.android.build.gradle.internal.pipeline.TransformManager
+import org.apache.commons.codec.digest.DigestUtils
+import org.apache.commons.io.FileUtils
+import javassist.*
+
+apply plugin: 'com.android.application'
+
+android {
+    compileSdkVersion 27
+    defaultConfig {
+        applicationId "com.example.apkresource"
+        minSdkVersion 15
+        targetSdkVersion 27
+        versionCode 1
+        versionName "1.0"
+        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation 'com.android.support:appcompat-v7:27.1.1'
+    implementation 'com.android.support.constraint:constraint-layout:1.1.2'
+    testImplementation 'junit:junit:4.12'
+    androidTestImplementation 'com.android.support.test:runner:1.0.2'
+    androidTestImplementation 'com.android.support.test.espresso:espresso-core:3.0.2'
+}
+
+class MyClassTransform extends Transform {
+    Project project
+    MyClassTransform(Project project) {
+        this.project = project
+    }
+
+    @Override
+    String getName() {
+        return "MyClassTransform"
+    }
+
+    @Override
+    Set<QualifiedContent.ContentType> getInputTypes() {
+        return TransformManager.CONTENT_CLASS
+    }
+
+    @Override
+    Set<QualifiedContent.Scope> getScopes() {
+        return TransformManager.SCOPE_FULL_PROJECT
+    }
+
+    @Override
+    boolean isIncremental() {
+        return false
+    }
+
+    @Override
+    void transform(TransformInvocation transformInvocation) throws TransformException, InterruptedException, IOException {
+        Collection<TransformInput> inputs = transformInvocation.getInputs()
+        Collection<TransformInput> referenceInputs = transformInvocation.getReferencedInputs()
+        TransformOutputProvider outputProvider = transformInvocation.getOutputProvider()
+
+        inputs.each {
+            TransformInput transformInput ->
+                transformInput.directoryInputs.each {
+                    directoryInput ->
+                        println directoryInput.file.absolutePath
+
+                        ClassPool pool = ClassPool.getDefault()
+                        //将当前路径加入类池,不然找不到这个类
+                        pool.appendClassPath(directoryInput.file.absolutePath)
+                        //project.android.bootClasspath 加入android.jar，不然找不到android相关的所有类
+                        pool.appendClassPath(project.android.bootClasspath[0].toString())
+                        //引入android.os.Bundle包，因为onCreate方法参数有Bundle
+                        pool.importPackage("android.os.Bundle")
+
+                        File dir = directoryInput.file
+                        if (dir.isDirectory()) {
+                            //遍历文件夹
+                            dir.eachFileRecurse { File file ->
+                                String filePath = file.absolutePath
+                                println("filePath = " + filePath)
+                                if (file.getName().equals("BugActivity.class")) {
+
+                                    //获取MainActivity.class
+                                    CtClass ctClass = pool.getCtClass("com.example.apkresource.BugActivity")
+                                    println("ctClass = " + ctClass)
+                                    //解冻
+                                    if (ctClass.isFrozen())
+                                        ctClass.defrost()
+
+                                    CtField ctField = new CtField(pool.get("com.example.apkresource.LocalInvoke"), "sInvoke", ctClass)
+                                    ctField.setModifiers(Modifier.STATIC|Modifier.PUBLIC)
+                                    ctClass.addField(ctField)
+
+                                    //获取到OnCreate方法
+                                    CtMethod ctMethod = ctClass.getDeclaredMethod("onCreate")
+
+                                    println("方法名 = " + ctMethod)
+
+                                    String insetBeforeStr = """if (sInvoke != null) { sInvoke.invoke("onCreate", \$0, new Object[] { \$1 }); return;  } """
+                                    //在方法开头插入代码
+                                    ctMethod.insertBefore(insetBeforeStr)
+                                    ctClass.writeFile(directoryInput.file.absolutePath)
+                                    ctClass.detach()//释放
+                                }
+                            }
+                        }
+                        def dest = outputProvider.getContentLocation(directoryInput.name,
+                                directoryInput.contentTypes, directoryInput.scopes, Format.DIRECTORY)
+
+                        FileUtils.copyDirectory(directoryInput.file, dest)
+                }
+
+                transformInput.jarInputs.each {
+                    jarInput ->
+                        println jarInput.file.absolutePath
+                        def jarName = jarInput.name
+                        println("jar = " + jarInput.file.getAbsolutePath())
+                        def md5Name = DigestUtils.md5Hex(jarInput.file.getAbsolutePath())
+                        if (jarName.endsWith(".jar")) {
+                            jarName = jarName.substring(0, jarName.length() - 4)
+                        }
+                        def dest = outputProvider.getContentLocation(jarName + md5Name, jarInput.contentTypes, jarInput.scopes, Format.JAR)
+                        FileUtils.copyFile(jarInput.file, dest)
+                }
+        }
+    }
+}
+
+android.registerTransform(new MyClassTransform(project))
