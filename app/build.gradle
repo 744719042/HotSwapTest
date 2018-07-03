@@ -6,6 +6,8 @@ import com.android.build.api.transform.TransformInput
 import com.android.build.api.transform.TransformInvocation
 import com.android.build.api.transform.TransformOutputProvider
 import com.android.build.gradle.internal.pipeline.TransformManager
+import javassist.expr.ExprEditor
+import javassist.expr.MethodCall
 import org.apache.commons.codec.digest.DigestUtils
 import org.apache.commons.io.FileUtils
 import javassist.*
@@ -78,6 +80,23 @@ class MyClassTransform extends Transform {
 
         inputs.each {
             TransformInput transformInput ->
+
+                transformInput.jarInputs.each {
+                    jarInput ->
+                        println jarInput.file.absolutePath
+                        ClassPool pool = ClassPool.getDefault()
+                        //将当前路径加入类池,不然找不到这个类
+                        pool.appendClassPath(jarInput.file.absolutePath)
+                        def jarName = jarInput.name
+                        println("jar = " + jarInput.file.getAbsolutePath())
+                        def md5Name = DigestUtils.md5Hex(jarInput.file.getAbsolutePath())
+                        if (jarName.endsWith(".jar")) {
+                            jarName = jarName.substring(0, jarName.length() - 4)
+                        }
+                        def dest = outputProvider.getContentLocation(jarName + md5Name, jarInput.contentTypes, jarInput.scopes, Format.JAR)
+                        FileUtils.copyFile(jarInput.file, dest)
+                }
+
                 transformInput.directoryInputs.each {
                     directoryInput ->
                         println directoryInput.file.absolutePath
@@ -87,6 +106,7 @@ class MyClassTransform extends Transform {
                         pool.appendClassPath(directoryInput.file.absolutePath)
                         //project.android.bootClasspath 加入android.jar，不然找不到android相关的所有类
                         pool.appendClassPath(project.android.bootClasspath[0].toString())
+
                         //引入android.os.Bundle包，因为onCreate方法参数有Bundle
                         pool.importPackage("android.os.Bundle")
 
@@ -97,9 +117,62 @@ class MyClassTransform extends Transform {
                                 String filePath = file.absolutePath
                                 println("filePath = " + filePath)
                                 if (file.getName().equals("BugActivity.class")) {
-
                                     //获取MainActivity.class
                                     CtClass ctClass = pool.getCtClass("com.example.apkresource.BugActivity")
+                                    CtClass helper = pool.makeClass("com.example.apkresource.BugActivityHelper")
+                                    helper.setSuperclass(ctClass.getSuperclass())
+                                    CtMethod onCreate = CtNewMethod.make('''
+                                        public static void onCreate(com.example.apkresource.BugActivity activity, android.os.Bundle savedInstance) {
+                                                android.util.Log.d("TEST", "call static onCreate");
+                                        }
+                                    ''', helper)
+                                    helper.addMethod(onCreate)
+                                    CtMethod method = CtNewMethod.make('''
+                                        public static void invokeSuper(com.example.apkresource.LocalInvoke invoke, com.example.apkresource.BugActivity activity, android.os.Bundle savedInstance) {
+                                            android.util.Log.d("TEST", "callsuper onCreate");
+                                            onCreate(activity, savedInstance);
+                                        }
+                                    ''', helper)
+                                    helper.addMethod(method)
+                                    helper.writeFile(directoryInput.file.absolutePath)
+                                    def helperFile = project.file("$project.buildDir/patch/com/example/apkresource/BugActivityHelper.class")
+                                    FileUtils.copyFile(new File(directoryInput.file.absolutePath, "com/example/apkResource/BugActivityHelper.class"), helperFile)
+                                    new File(directoryInput.file.absolutePath, "com/example/apkResource/BugActivityHelper.class").delete()
+                                    helper.defrost()
+
+                                    CtClass patch = pool.makeClass("com.example.apkresource.BugActivity\$Override")
+                                    CtMethod invokeMethod = CtNewMethod.make('''
+                                        public static void onCreate(com.example.apkresource.LocalInvoke invoke, com.example.apkresource.BugActivity activity, android.os.Bundle savedInstance) {
+                                             android.util.Log.d("TEST", "$Override invoke onCreate");
+                                            com.example.apkresource.BugActivityHelper.invokeSuper(invoke, activity, savedInstance);
+                                            activity.setContentView(com.example.apkresource.R.layout.activity_bug);
+                                            android.widget.TextView textView = (android.widget.TextView) activity.findViewById(com.example.apkresource.R.id.textView);
+                                            textView.setText("Hello World");
+                                            try {
+                                                java.lang.reflect.Field field = com.example.apkresource.BugActivity.class.getDeclaredField("textView");     
+                                                field.setAccessible(true);
+                                                field.set(activity, textView);
+                                            } catch (Exception e) {
+                                            }
+                                        }
+                                    ''', patch)
+                                    patch.addMethod(invokeMethod)
+                                    patch.addInterface(pool.get('com.example.apkresource.LocalInvoke'))
+                                    CtMethod impl = CtMethod.make('''
+                                        public Object invoke(String methodName, Object obj, Object[] args) {
+                                            android.util.Log.d("TEST", "invoke " + methodName);
+                                            if (methodName.equals("onCreate")) {
+                                                onCreate($0, (com.example.apkresource.BugActivity) obj, (android.os.Bundle) args[0]);
+                                            }
+                                            
+                                            return null;
+                                        }
+                                    ''', patch)
+                                    patch.addMethod(impl)
+                                    patch.writeFile(directoryInput.file.absolutePath)
+                                    def patchFile = project.file("$project.buildDir/patch/com/example/apkresource/BugActivity\$Override.class")
+                                    FileUtils.copyFile(new File(directoryInput.file.absolutePath, "com/example/apkResource/BugActivity\$Override.class"), patchFile)
+                                    new File(directoryInput.file.absolutePath, "com/example/apkResource/BugActivity\$Override.class").delete()
                                     println("ctClass = " + ctClass)
                                     //解冻
                                     if (ctClass.isFrozen())
@@ -114,7 +187,13 @@ class MyClassTransform extends Transform {
 
                                     println("方法名 = " + ctMethod)
 
-                                    String insetBeforeStr = """if (sInvoke != null) { sInvoke.invoke("onCreate", \$0, new Object[] { \$1 }); return;  } """
+                                    String insetBeforeStr = """
+                                    if (sInvoke != null) { 
+                                        android.util.Log.d("TEST", "invoke static localInvoke");
+                                        sInvoke.invoke("onCreate", \$0, new Object[] { \$1 }); 
+                                        return;  
+                                    } 
+                                    """
                                     //在方法开头插入代码
                                     ctMethod.insertBefore(insetBeforeStr)
                                     ctClass.writeFile(directoryInput.file.absolutePath)
@@ -127,21 +206,82 @@ class MyClassTransform extends Transform {
 
                         FileUtils.copyDirectory(directoryInput.file, dest)
                 }
-
-                transformInput.jarInputs.each {
-                    jarInput ->
-                        println jarInput.file.absolutePath
-                        def jarName = jarInput.name
-                        println("jar = " + jarInput.file.getAbsolutePath())
-                        def md5Name = DigestUtils.md5Hex(jarInput.file.getAbsolutePath())
-                        if (jarName.endsWith(".jar")) {
-                            jarName = jarName.substring(0, jarName.length() - 4)
-                        }
-                        def dest = outputProvider.getContentLocation(jarName + md5Name, jarInput.contentTypes, jarInput.scopes, Format.JAR)
-                        FileUtils.copyFile(jarInput.file, dest)
-                }
         }
     }
 }
 
 android.registerTransform(new MyClassTransform(project))
+
+afterEvaluate {
+    def assembleDebug = project.tasks.findByName("assembleDebug")
+    assembleDebug.doLast {
+        def patchFile = project.file("$project.buildDir/patch")
+        def command = "dx --dex --output $buildDir/patch.dex $patchFile.absolutePath"
+        println command
+        project.exec {
+            executable 'cmd'
+            args '/c', command
+        }
+
+        def dex2smali = "d2j-baksmali -o $buildDir/smali $buildDir/patch.dex"
+        println dex2smali
+        project.exec {
+            executable 'cmd'
+            args '/c', dex2smali
+        }
+
+        def smali = project.file("$project.buildDir/smali/com/example/apkresource/BugActivityHelper.smali")
+        def resultDir = project.file("$project.buildDir/result/com/exmaple/apkresource/")
+        if (!resultDir.exists()) {
+            resultDir.mkdirs()
+        }
+        def result = new File(resultDir, "BugActivityHelper.smali")
+        def overrideSrc = project.file("$project.buildDir/smali/com/example/apkresource/BugActivity\$Override.smali")
+        def overrideDest = new File(resultDir, "BugActivity\$Override.smali")
+        FileUtils.copyFile(overrideSrc, overrideDest)
+
+        List<String> list = new ArrayList<>()
+        boolean isInOnCreate = false
+        boolean skipLine = false
+        smali.eachLine {
+            if (it.startsWith(".method") && it.contains("onCreate")) {
+                isInOnCreate = true
+            }
+
+            if (it.startsWith(".end method") && isInOnCreate) {
+                isInOnCreate = false
+                skipLine = true
+            }
+
+            if (!isInOnCreate && !skipLine) {
+                if (it.contains('invoke-static') && it.contains('Lcom/example/apkresource/BugActivityHelper;')) {
+                    CtClass ctClass = ClassPool.getDefault().get('com.example.apkresource.BugActivity')
+                    ctClass.defrost()
+                    String superClassName = ctClass.getSuperclass().getName().replaceAll("\\.", "/")
+                    def line = it.replace('invoke-static', 'invoke-super')
+                    line = line.replace('Lcom/example/apkresource/BugActivityHelper;', "L$superClassName;")
+                    line = line.replace('Lcom/example/apkresource/BugActivity;', '')
+                    list.add(line)
+                } else {
+                    list.add(it)
+                }
+            }
+
+            skipLine = false
+        }
+
+        if (!result.exists()) result.createNewFile()
+        result.withPrintWriter { writer ->
+            list.each {
+                writer.println(it)
+            }
+        }
+
+        def smali2dex = "d2j-smali -o $buildDir/final.dex $buildDir/result"
+        println smali2dex
+        project.exec {
+            executable 'cmd'
+            args '/c', smali2dex
+        }
+    }
+}
