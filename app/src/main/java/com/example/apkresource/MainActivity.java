@@ -55,7 +55,6 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             String dexPath = Environment.getExternalStorageDirectory() + File.separator + "final.dex";
             String dexOptPath = getCacheDir().getAbsolutePath() + File.separator + "DEX";
 
-            File patch = new File(dexPath);
             try {
                 DexFile dexFile = DexFile.loadDex(dexPath, dexOptPath, 0);
                 Enumeration<String> enumeration = dexFile.entries();
